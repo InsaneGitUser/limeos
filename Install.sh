@@ -39,6 +39,14 @@ echo -e "${RST}"
 echo -e "  ${BLD}LimeOS Installer${RST} — Arch-based"
 echo ""
 
+# ── INSTALL DIALOG ────────────────────────────────────────────────────────────
+# dialog is not included in the Arch live ISO by default
+if ! command -v dialog >/dev/null 2>&1; then
+    echo -e "${BLD}Installing dialog...${RST}"
+    pacman -Sy --noconfirm dialog >> "$LOG" 2>&1 \
+        || { echo -e "${RED}Failed to install dialog — check internet connection.${RST}"; exit 1; }
+fi
+
 # ── DEPENDENCY CHECK ──────────────────────────────────────────────────────────
 for cmd in pacstrap arch-chroot parted mkfs.fat mkfs.ext4 blkid lsblk sgdisk dialog curl; do
     command -v "$cmd" >/dev/null 2>&1 \
