@@ -18,7 +18,7 @@ set -e
 
 REPO="https://raw.githubusercontent.com/InsaneGitUser/My-Shit/main"
 PACKAGES_URL="$REPO/packages.txt"
-CONFIG_URL="$REPO/config.tar.gz"
+CONFIG_URL="https://media.githubusercontent.com/media/InsaneGitUser/My-Shit/main/config.tar.gz"
 START_ICON_URL="$REPO/start.png"
 NEW_USER="lime"
 TARGET="/mnt"
@@ -404,7 +404,7 @@ HOSTS
 do_config() {
     log "Downloading config.tar.gz"
     local tarball; tarball=$(mktemp /tmp/config.XXXXXX.tar.gz)
-    curl -fsSL "$CONFIG_URL" -o "$tarball" \
+    curl -fsSL -L "$CONFIG_URL" -o "$tarball" \
         || die "Failed to download config.tar.gz"
 
     log "Extracting config bundle"
