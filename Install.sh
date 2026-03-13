@@ -1,9 +1,29 @@
 #!/bin/bash
+# =============================================================================
+#  LimeOS Installer
+#  Run from Arch Linux live ISO:
+#    bash <(curl -s https://raw.githubusercontent.com/InsaneGitUser/My-Shit/refs/heads/main/install.sh)
+#
+#  Requires: internet connection (connect wifi with iwctl before running)
+#  Does:
+#    1.  Ask firmware (auto-detected, overridable)
+#    2.  Ask install mode (full disk or dual-boot partition)
+#    3.  Pick disk or partition
+#    4.  UEFI: pick or create ESP
+#    5.  BIOS + GPT guard
+#    6.  Partition + format
+#    7.  pacstrap with packages.txt from GitHub
+#    8.  arch-chroot: locale, hostname, root+lime user, passwords, GRUB
+#    9.  Download + extract config.tar.gz into lime's home + system dirs
+#   10.  Enable systemd services
+# =============================================================================
+
 set -e
 
-REPO="https://raw.githubusercontent.com/InsaneGitUser/My-Shit/refs/heads/main"
+REPO="https://raw.githubusercontent.com/InsaneGitUser/My-Shit/main"
 PACKAGES_URL="$REPO/packages.txt"
-CONFIG_URL="https://github.com/InsaneGitUser/My-Shit/raw/main/config.tar.gz"
+CONFIG_URL="$REPO/config.tar.gz"
+START_ICON_URL="$REPO/start.png"
 NEW_USER="lime"
 TARGET="/mnt"
 LOG="/tmp/limeos-install.log"
@@ -445,6 +465,11 @@ do_config() {
 
     # Fix ownership of everything in user home
     arch-chroot "$TARGET" chown -R "$NEW_USER:$NEW_USER" "/home/$NEW_USER"
+
+    # Start menu icon
+    log "  Applying start icon"
+    curl -fsSL "$START_ICON_URL" -o "$TARGET/etc/start.png" \
+        || warn "start.png not found in repo (skipping)"
 
     rm -rf "$extract"
     log "Config applied."
