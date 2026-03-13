@@ -63,7 +63,7 @@ echo ""
 # dialog is not included in the Arch live ISO by default
 if ! command -v dialog >/dev/null 2>&1; then
     echo -e "${BLD}Installing dialog...${RST}"
-    pacman -Sy --noconfirm dialog >> "$LOG" 2>&1 \
+    pacman -Sy --noconfirm dialog \
         || { echo -e "${RED}Failed to install dialog — check internet connection.${RST}"; exit 1; }
 fi
 
