@@ -355,6 +355,10 @@ do_chroot() {
 127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
 HOSTS
 
+    # Enable multilib in new install for steam and 32-bit packages
+    grep -qF '[multilib]' "$TARGET/etc/pacman.conf" || \
+        printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> "$TARGET/etc/pacman.conf"
+
     for svc in "${SERVICES[@]}"; do
         arch-chroot "$TARGET" systemctl enable "$svc" >> "$LOG" 2>&1 \
             && log "  Enabled $svc" \
@@ -484,6 +488,12 @@ cleanup() {
 trap cleanup EXIT
 
 # ── RUN ───────────────────────────────────────────────────────────────────────
+# Enable multilib for steam and 32-bit packages
+log "Enabling multilib repo"
+grep -qF '[multilib]' /etc/pacman.conf || \
+    printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
+pacman -Sy >> "$LOG" 2>&1
+
 do_pacstrap
 do_chroot
 do_config
