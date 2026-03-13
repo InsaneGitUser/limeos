@@ -325,7 +325,7 @@ do_pacstrap() {
     [ ${#pkgs[@]} -eq 0 ] && die "packages.txt is empty"
     log "Installing ${#pkgs[@]} packages"
 
-    pacstrap -K "$TARGET" \
+    pacstrap -K --config /etc/pacman.conf "$TARGET" \
         base base-devel linux linux-firmware \
         grub os-prober efibootmgr networkmanager \
         "${pkgs[@]}" \
