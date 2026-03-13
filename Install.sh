@@ -356,8 +356,7 @@ do_chroot() {
 HOSTS
 
     # Enable multilib in new install for steam and 32-bit packages
-    grep -qF '[multilib]' "$TARGET/etc/pacman.conf" || \
-        printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> "$TARGET/etc/pacman.conf"
+    sed -i '/^#\[multilib\]/{s/^#//;n;s/^#//}' "$TARGET/etc/pacman.conf"
 
     for svc in "${SERVICES[@]}"; do
         arch-chroot "$TARGET" systemctl enable "$svc" >> "$LOG" 2>&1 \
@@ -488,11 +487,13 @@ cleanup() {
 trap cleanup EXIT
 
 # ── RUN ───────────────────────────────────────────────────────────────────────
-# Enable multilib for steam and 32-bit packages
+
+# Enable multilib by uncommenting the existing section in pacman.conf
 log "Enabling multilib repo"
-grep -qF '[multilib]' /etc/pacman.conf || \
-    printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
+sed -i '/^#\[multilib\]/{s/^#//;n;s/^#//}' /etc/pacman.conf
 pacman -Sy >> "$LOG" 2>&1
+# Copy the updated pacman.conf to new root so multilib stays enabled after install
+# (pacstrap -K copies it during init, so we patch it after pacstrap finishes in do_chroot)
 
 do_pacstrap
 do_chroot
