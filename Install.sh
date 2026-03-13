@@ -402,15 +402,11 @@ HOSTS
 
 # ── APPLY CONFIG ──────────────────────────────────────────────────────────────
 do_config() {
-    log "Downloading config.tar.gz"
-    local tarball; tarball=$(mktemp /tmp/config.XXXXXX.tar.gz)
-    curl -fsSL -L "$CONFIG_URL" -o "$tarball" \
-        || die "Failed to download config.tar.gz"
-
-    log "Extracting config bundle"
+    log "Downloading and extracting config.tar.gz to /tmp"
     local extract; extract=$(mktemp -d /tmp/config.XXXXXX)
-    tar -xzf "$tarball" -C "$extract" || die "Failed to extract config.tar.gz"
-    rm -f "$tarball"
+    # Stream directly into tar — no temp tarball on disk, saves ~370MB of ramdisk
+    curl -fsSL -L "$CONFIG_URL" | tar -xz -C "$extract" \
+        || die "Failed to download or extract config.tar.gz"
 
     local bundle="$extract"
     [ -d "$extract/limeos-config" ] && bundle="$extract/limeos-config"
