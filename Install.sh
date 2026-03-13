@@ -2,20 +2,16 @@
 # =============================================================================
 #  LimeOS Installer
 #  Run from Arch Linux live ISO:
-#    bash <(curl -s https://raw.githubusercontent.com/InsaneGitUser/My-Shit/refs/heads/main/install.sh)
+#    bash <(curl -s https://raw.githubusercontent.com/InsaneGitUser/My-Shit/main/install.sh)
 #
 #  Requires: internet connection (connect wifi with iwctl before running)
-#  Does:
-#    1.  Ask firmware (auto-detected, overridable)
-#    2.  Ask install mode (full disk or dual-boot partition)
-#    3.  Pick disk or partition
-#    4.  UEFI: pick or create ESP
-#    5.  BIOS + GPT guard
-#    6.  Partition + format
-#    7.  pacstrap with packages.txt from GitHub
-#    8.  arch-chroot: locale, hostname, root+lime user, passwords, GRUB
-#    9.  Download + extract config.tar.gz into lime's home + system dirs
-#   10.  Enable systemd services
+#
+#  Partitioning:
+#    Full disk  — script does everything automatically:
+#                 UEFI: 1MB gap + 512MB ESP (FAT32) + root (ext4)
+#                 BIOS: 1MB BIOS boot + root (ext4)
+#    Dual boot  — user carves free space in cfdisk, then picks root partition.
+#                 Script auto-creates BIOS boot or detects/creates ESP.
 # =============================================================================
 
 set -e
@@ -60,15 +56,15 @@ echo -e "  ${BLD}LimeOS Installer${RST} — Arch-based"
 echo ""
 
 # ── INSTALL DIALOG ────────────────────────────────────────────────────────────
-# dialog is not included in the Arch live ISO by default
 if ! command -v dialog >/dev/null 2>&1; then
     echo -e "${BLD}Installing dialog...${RST}"
     pacman -Sy --noconfirm dialog \
-        || { echo -e "${RED}Failed to install dialog — check internet connection.${RST}"; exit 1; }
+        || { echo -e "${RED}Failed to install dialog — check internet.${RST}"; exit 1; }
 fi
 
 # ── DEPENDENCY CHECK ──────────────────────────────────────────────────────────
-for cmd in pacstrap arch-chroot parted mkfs.fat mkfs.ext4 blkid lsblk sgdisk dialog curl; do
+for cmd in pacstrap arch-chroot parted mkfs.fat mkfs.ext4 blkid lsblk \
+           sgdisk partprobe dialog curl cfdisk; do
     command -v "$cmd" >/dev/null 2>&1 \
         || die "Missing: $cmd — are you running from the Arch live ISO?"
 done
@@ -85,8 +81,8 @@ parent_disk() {
         -e 's|[0-9][0-9]*$||'
 }
 
-# ── DISK/PARTITION PICKERS ────────────────────────────────────────────────────
 pick_disk() {
+    local prompt="$1"
     local -a args=()
     while IFS= read -r line; do
         local name size model
@@ -96,17 +92,17 @@ pick_disk() {
         args+=("/dev/$name" "$size ${model:-Unknown}")
     done < <(lsblk -dno NAME,SIZE,MODEL | grep -v '^loop\|^sr')
     [ ${#args[@]} -eq 0 ] && die "No disks found."
-    dialog --stdout --title "LimeOS Installer" --menu "$1" 20 76 12 "${args[@]}"
+    dialog --stdout --title "LimeOS Installer" --menu "$prompt" 20 76 12 "${args[@]}"
 }
 
 pick_partition() {
-    local filter="$1"
+    local disk="$1" prompt="$2"
     local -a args=()
     while IFS= read -r line; do
         local name size fs label
-        name=$(awk '{print $1}' <<< "$line")
-        size=$(awk '{print $2}' <<< "$line")
-        fs=$(awk '{print $3}'   <<< "$line")
+        name=$(awk '{print $1}'  <<< "$line")
+        size=$(awk '{print $2}'  <<< "$line")
+        fs=$(awk '{print $3}'    <<< "$line")
         label=$(awk '{print $4}' <<< "$line")
         local desc="$size"
         [ -n "$fs"    ] && desc="$desc [$fs]"
@@ -114,174 +110,203 @@ pick_partition() {
         args+=("$name" "$desc")
     done < <(lsblk -pno NAME,SIZE,FSTYPE,LABEL,TYPE \
         | awk '$5=="part"' \
-        | grep "^${filter}")
+        | grep "^${disk}")
     [ ${#args[@]} -eq 0 ] && return 1
-    dialog --stdout --title "LimeOS Installer" \
-        --menu "Select partition to install onto:" 20 76 12 "${args[@]}"
+    dialog --stdout --title "LimeOS Installer" --menu "$prompt" 20 76 12 "${args[@]}"
 }
 
-# ── SCREEN: FIRMWARE ──────────────────────────────────────────────────────────
-screen_firmware() {
-    local det; det=$(detect_firmware)
-    local d_uefi="off" d_bios="off"
-    [ "$det" = "uefi" ] && d_uefi="on" || d_bios="on"
-    FIRMWARE=$(dialog --stdout --title "LimeOS Installer" \
-        --radiolist "Boot firmware (detected: ${det^^}):" 10 60 2 \
-        "uefi" "UEFI — GPT + EFI System Partition" "$d_uefi" \
-        "bios" "Legacy BIOS — MBR bootloader"      "$d_bios") \
+# ── DETECT FIRMWARE ───────────────────────────────────────────────────────────
+FIRMWARE=$(detect_firmware)
+log "Firmware: $FIRMWARE"
+
+# ── INSTALL MODE ──────────────────────────────────────────────────────────────
+INSTALL_MODE=$(dialog --stdout --title "LimeOS Installer" \
+    --radiolist "Installation mode:" 10 70 2 \
+    "fulldisk"  "Full disk — erase entire disk, automatic partitioning" "on" \
+    "dualboot"  "Dual boot — keep existing OS, install alongside it"    "off") \
+    || die "Cancelled."
+log "Mode: $INSTALL_MODE"
+
+# ── PICK DISK ─────────────────────────────────────────────────────────────────
+if [ "$INSTALL_MODE" = "fulldisk" ]; then
+    TARGET_DISK=$(pick_disk "WARNING: entire disk will be ERASED:") \
         || die "Cancelled."
-    log "Firmware: $FIRMWARE"
-}
-
-# ── SCREEN: INSTALL MODE ──────────────────────────────────────────────────────
-screen_mode() {
-    INSTALL_MODE=$(dialog --stdout --title "LimeOS Installer" \
-        --radiolist "Installation mode:" 10 70 2 \
-        "fulldisk"  "Full disk — erase entire disk"                        "off" \
-        "partition" "Partition — install alongside existing OS (dual-boot)" "on") \
+    dialog --title "LimeOS Installer" \
+        --yesno "ERASE ALL DATA on $TARGET_DISK?\n\nThis cannot be undone." 8 50 \
+        || die "Aborted."
+else
+    TARGET_DISK=$(pick_disk "Select the disk that has free space for LimeOS:") \
         || die "Cancelled."
-    log "Mode: $INSTALL_MODE"
-}
+fi
+log "Disk: $TARGET_DISK"
 
-# ── SCREEN: DISK / PARTITION ──────────────────────────────────────────────────
-screen_pick_target() {
-    if [ "$INSTALL_MODE" = "fulldisk" ]; then
-        TARGET_DISK=$(pick_disk "WARNING: entire disk will be ERASED:") \
-            || die "Cancelled."
-        dialog --title "LimeOS Installer" \
-            --yesno "ERASE ALL DATA on $TARGET_DISK?\n\nThis cannot be undone." 8 50 \
-            || die "Aborted."
+# ── PARTITION ─────────────────────────────────────────────────────────────────
+TARGET_ESP=""
+TARGET_PART=""
+
+if [ "$INSTALL_MODE" = "fulldisk" ]; then
+    log "Wiping $TARGET_DISK"
+    dd if=/dev/zero of="$TARGET_DISK" bs=512 count=2048 2>/dev/null || true
+    sync
+
+    if [ "$FIRMWARE" = "uefi" ]; then
+        log "Partitioning for UEFI: 1MiB gap + 512MiB ESP + root"
+        parted -s "$TARGET_DISK" \
+            mklabel gpt \
+            mkpart ESP  fat32 1MiB   513MiB \
+            set 1 esp on \
+            mkpart ROOT ext4  513MiB 100%
+        partprobe "$TARGET_DISK"; sleep 2
+        TARGET_ESP=$(lsblk -rno NAME "$TARGET_DISK" \
+            | grep -v "^$(basename "$TARGET_DISK")$" \
+            | awk 'NR==1{print "/dev/" $1}')
+        TARGET_PART=$(lsblk -rno NAME "$TARGET_DISK" \
+            | grep -v "^$(basename "$TARGET_DISK")$" \
+            | awk 'NR==2{print "/dev/" $1}')
+        [ -b "$TARGET_ESP" ]  || die "ESP not found after partitioning"
+        [ -b "$TARGET_PART" ] || die "Root partition not found after partitioning"
+        log "Formatting ESP $TARGET_ESP as FAT32"
+        mkfs.fat -F32 -n EFI "$TARGET_ESP"
     else
-        local scope
-        scope=$(pick_disk "Which disk contains your target partition?") \
-            || die "Cancelled."
-        TARGET_PART=$(pick_partition "$scope") || \
-            TARGET_PART=$(pick_partition "") || \
-            die "No partitions found. Create one first with cfdisk."
-        TARGET_DISK=$(parent_disk "$TARGET_PART")
-        dialog --title "LimeOS Installer" \
-            --yesno "Format and install onto $TARGET_PART?\n\nOnly this partition will be touched." 8 58 \
-            || die "Aborted."
+        log "Partitioning for BIOS: 1MiB BIOS boot + root"
+        parted -s "$TARGET_DISK" \
+            mklabel gpt \
+            mkpart biosboot 1MiB 2MiB \
+            set 1 bios_grub on \
+            mkpart ROOT ext4 2MiB 100%
+        partprobe "$TARGET_DISK"; sleep 2
+        TARGET_PART=$(lsblk -rno NAME "$TARGET_DISK" \
+            | grep -v "^$(basename "$TARGET_DISK")$" \
+            | awk 'NR==2{print "/dev/" $1}')
+        [ -b "$TARGET_PART" ] || die "Root partition not found after partitioning"
+        # BIOS boot partition is never formatted — GRUB writes to it directly
     fi
-    log "Target disk: ${TARGET_DISK}  partition: ${TARGET_PART:-will create}"
-}
 
-# ── SCREEN: ESP ───────────────────────────────────────────────────────────────
-screen_esp() {
-    [ "$FIRMWARE" != "uefi" ] && TARGET_ESP="" && return 0
-    local existing
-    existing=$(lsblk -pno NAME,PARTTYPE "$TARGET_DISK" 2>/dev/null \
-        | grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" \
-        | awk '{print $1}' | head -1 || true)
-    if [ -n "$existing" ]; then
-        local esz; esz=$(lsblk -no SIZE "$existing" | head -1)
-        local choice
-        choice=$(dialog --stdout --title "LimeOS Installer" \
-            --radiolist "EFI System Partition:" 10 72 2 \
-            "reuse"  "Reuse $existing ($esz) — preserves Windows/other OS boot" "on" \
-            "create" "Create new 512MB ESP — only if no other OS on this disk"  "off") \
-            || die "Cancelled."
-        [ "$choice" = "reuse" ] && TARGET_ESP="$existing" || TARGET_ESP=""
-    else
-        dialog --title "LimeOS Installer" --msgbox \
-            "No ESP found on $TARGET_DISK.\nA new 512MB ESP will be created in free space." 8 58
-        TARGET_ESP=""
-    fi
-    log "ESP: ${TARGET_ESP:-will create}"
-}
+else
+    # ── DUAL BOOT ─────────────────────────────────────────────────────────────
+    dialog --title "LimeOS Installer" --msgbox \
+"Next, cfdisk will open so you can create a partition in the free space.
 
-# ── BIOS + GPT GUARD ──────────────────────────────────────────────────────────
-check_bios_gpt() {
-    [ "$FIRMWARE" != "bios" ]          && return 0
-    [ "$INSTALL_MODE" != "partition" ] && return 0
-    local pttype
-    pttype=$(lsblk -no PTTYPE "$TARGET_DISK" 2>/dev/null | head -1 || true)
-    [ "$pttype" != "gpt" ] && return 0
-    local has_biosgrub
-    has_biosgrub=$(lsblk -pno NAME,PARTTYPE "$TARGET_DISK" 2>/dev/null \
-        | grep -i "21686148-6449-6e6f-744e-656564454649" || true)
-    if [ -z "$has_biosgrub" ]; then
-        dialog --title "BIOS + GPT Warning" --msgbox \
-"$TARGET_DISK uses GPT but you selected Legacy BIOS.
+Just create ONE new partition using the free space and set its
+type to 'Linux filesystem'. Do not touch existing partitions.
 
-GRUB needs a 1MiB BIOS boot partition on GPT disks.
-None was found. Options:
-  1. Switch to UEFI if your machine supports it
-  2. Add a 1MiB BIOS boot partition with cgdisk first
+$([ "$FIRMWARE" = "bios" ] && echo "BIOS mode: The 1MB BIOS boot partition will be
+created automatically — you do not need to make it.")" 14 62
 
-Installer will continue but GRUB may fail." 14 58
-        warn "BIOS on GPT without bios_grub partition"
-    fi
-}
+    clear
+    echo -e "${BLD}Launching cfdisk — create your root partition in free space, then quit.${RST}"
+    sleep 1
+    cfdisk "$TARGET_DISK"
 
-# ── PARTITIONING ──────────────────────────────────────────────────────────────
-do_partition() {
-    if [ "$INSTALL_MODE" = "fulldisk" ]; then
-        log "Wiping and partitioning $TARGET_DISK"
-        dd if=/dev/zero of="$TARGET_DISK" bs=512 count=2048 2>/dev/null || true
-        sync
-        if [ "$FIRMWARE" = "uefi" ]; then
-            parted -s "$TARGET_DISK" \
-                mklabel gpt \
-                mkpart ESP  fat32 1MiB   513MiB \
-                set 1 esp on \
-                mkpart ROOT ext4  513MiB 100%
-            partprobe "$TARGET_DISK"; sleep 2
-            TARGET_ESP=$(lsblk -rno NAME "$TARGET_DISK" \
-                | grep -v "^$(basename "$TARGET_DISK")$" \
-                | awk 'NR==1{print "/dev/" $1}')
-            TARGET_PART=$(lsblk -rno NAME "$TARGET_DISK" \
-                | grep -v "^$(basename "$TARGET_DISK")$" \
-                | awk 'NR==2{print "/dev/" $1}')
-            [ -b "$TARGET_ESP" ]  || die "ESP not found after partitioning"
-            [ -b "$TARGET_PART" ] || die "Root partition not found after partitioning"
-            mkfs.fat -F32 -n EFI "$TARGET_ESP"
+    # Let user pick which partition they just created
+    TARGET_PART=$(pick_partition "$TARGET_DISK" \
+        "Select the partition you just created for LimeOS root:") \
+        || die "No partitions found on $TARGET_DISK."
+
+    dialog --title "LimeOS Installer" \
+        --yesno "Format $TARGET_PART as ext4 and install LimeOS onto it?\n\nAll data on this partition will be lost." 8 62 \
+        || die "Aborted."
+
+    if [ "$FIRMWARE" = "uefi" ]; then
+        # Look for existing ESP
+        existing_esp=$(lsblk -pno NAME,PARTTYPE "$TARGET_DISK" 2>/dev/null \
+            | grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" \
+            | awk '{print $1}' | head -1 || true)
+        if [ -n "$existing_esp" ]; then
+            esz=$(lsblk -no SIZE "$existing_esp" | head -1)
+            choice=$(dialog --stdout --title "LimeOS Installer" \
+                --radiolist "EFI System Partition:" 10 72 2 \
+                "use"  "Use existing $existing_esp ($esz) — recommended for dual boot" "on" \
+                "new"  "Create new ESP — only if no other OS on this disk"              "off") \
+                || die "Cancelled."
+            [ "$choice" = "use" ] && TARGET_ESP="$existing_esp" || TARGET_ESP=""
         else
-            parted -s "$TARGET_DISK" \
-                mklabel msdos \
-                mkpart primary ext4 1MiB 100% \
-                set 1 boot on
-            partprobe "$TARGET_DISK"; sleep 2
-            TARGET_PART=$(lsblk -rno NAME "$TARGET_DISK" \
-                | grep -v "^$(basename "$TARGET_DISK")$" \
-                | awk 'NR==1{print "/dev/" $1}')
-            [ -b "$TARGET_PART" ] || die "Root partition not found after partitioning"
-            TARGET_ESP=""
-        fi
-    fi
+            dialog --title "LimeOS Installer" --msgbox \
+"No EFI System Partition was found on $TARGET_DISK.
 
-    # UEFI dual-boot — create ESP if none exists
-    if [ "$FIRMWARE" = "uefi" ] && [ -z "$TARGET_ESP" ]; then
-        log "Creating 512MB ESP on $TARGET_DISK"
-        local next
+A new 512MB ESP will be created in free space using sgdisk.
+Make sure at least 512MB of unallocated space remains on the disk." 10 60
+        fi
+
+        # Create ESP if needed
+        if [ -z "$TARGET_ESP" ]; then
+            log "Creating 512MB ESP on $TARGET_DISK"
+            local next
+            next=$(sgdisk -p "$TARGET_DISK" 2>/dev/null \
+                | awk '/^[[:space:]]+[0-9]/{n=$1} END{print n+0+1}')
+            [ -z "$next" ] && next=2
+            sgdisk -n "${next}:0:+512M" -t "${next}:EF00" -c "${next}:EFI" \
+                "$TARGET_DISK" \
+                || die "sgdisk failed — not enough free space for 512MB ESP"
+            partprobe "$TARGET_DISK"; sleep 2
+            TARGET_ESP=$(lsblk -pno NAME,PARTTYPE "$TARGET_DISK" \
+                | grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" \
+                | awk '{print $1}' | tail -1)
+            [ -n "$TARGET_ESP" ] || die "ESP not found after creation"
+            mkfs.fat -F32 -n EFI "$TARGET_ESP"
+            log "New ESP: $TARGET_ESP"
+        fi
+
+    else
+        # BIOS dual boot — add 1MB BIOS boot partition in free space
+        log "Creating 1MB BIOS boot partition on $TARGET_DISK"
         next=$(sgdisk -p "$TARGET_DISK" 2>/dev/null \
             | awk '/^[[:space:]]+[0-9]/{n=$1} END{print n+0+1}')
         [ -z "$next" ] && next=2
-        sgdisk -n "${next}:0:+512M" -t "${next}:EF00" -c "${next}:EFI" "$TARGET_DISK" \
-            || die "sgdisk failed — not enough free space for 512MB ESP"
+        sgdisk -n "${next}:0:+1M" -t "${next}:EF02" -c "${next}:BIOS boot" \
+            "$TARGET_DISK" \
+            || die "sgdisk failed — not enough free space for BIOS boot partition"
         partprobe "$TARGET_DISK"; sleep 2
-        TARGET_ESP=$(lsblk -pno NAME,PARTTYPE "$TARGET_DISK" \
-            | grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" \
-            | awk '{print $1}' | tail -1)
-        [ -n "$TARGET_ESP" ] || die "ESP not found after creation"
-        mkfs.fat -F32 -n EFI "$TARGET_ESP"
+        log "BIOS boot partition created"
     fi
+fi
 
-    log "Formatting $TARGET_PART as ext4"
-    mkfs.ext4 -F -L "LimeOS" "$TARGET_PART" || die "mkfs.ext4 failed"
-    log "Partitioning done: ROOT=$TARGET_PART ESP=${TARGET_ESP:-none}"
-}
+log "Partitioning done: ROOT=$TARGET_PART ESP=${TARGET_ESP:-none}"
+
+# ── FORMAT ROOT ───────────────────────────────────────────────────────────────
+log "Formatting $TARGET_PART as ext4"
+mkfs.ext4 -F -L "LimeOS" "$TARGET_PART" || die "mkfs.ext4 failed"
+
+# Format ESP only if we just created it fresh (skip if reusing Windows ESP)
+if [ "$FIRMWARE" = "uefi" ] && [ -n "$TARGET_ESP" ]; then
+    existing_fs=$(lsblk -no FSTYPE "$TARGET_ESP" 2>/dev/null | head -1)
+    if [ "$existing_fs" != "vfat" ]; then
+        log "Formatting $TARGET_ESP as FAT32"
+        mkfs.fat -F32 -n EFI "$TARGET_ESP" || die "mkfs.fat failed"
+    else
+        log "ESP already FAT32 — skipping format (preserving existing boot entries)"
+    fi
+fi
 
 # ── MOUNT ─────────────────────────────────────────────────────────────────────
-do_mount() {
-    log "Mounting filesystems"
-    mount "$TARGET_PART" "$TARGET"
-    if [ "$FIRMWARE" = "uefi" ] && [ -n "$TARGET_ESP" ]; then
-        mkdir -p "$TARGET/boot/efi"
-        mount "$TARGET_ESP" "$TARGET/boot/efi"
-        log "ESP mounted at $TARGET/boot/efi"
-    fi
-}
+log "Mounting filesystems"
+mount "$TARGET_PART" "$TARGET"
+if [ "$FIRMWARE" = "uefi" ] && [ -n "$TARGET_ESP" ]; then
+    mkdir -p "$TARGET/boot/efi"
+    mount "$TARGET_ESP" "$TARGET/boot/efi"
+    log "ESP mounted at $TARGET/boot/efi"
+fi
+
+# ── HOSTNAME ──────────────────────────────────────────────────────────────────
+HOSTNAME=$(dialog --stdout --title "LimeOS Installer" \
+    --inputbox "Enter a hostname for this machine:" 8 50) \
+    || die "Cancelled."
+[ -z "$HOSTNAME" ] && HOSTNAME="limeos"
+
+# ── FINAL CONFIRM ─────────────────────────────────────────────────────────────
+esp_line="  ESP:       ${TARGET_ESP:-N/A (BIOS mode)}"
+dialog --title "LimeOS Installer" --yesno \
+"Ready to install. Summary:
+
+  Firmware:  $FIRMWARE
+  Mode:      $INSTALL_MODE
+  Disk:      $TARGET_DISK
+  Root:      $TARGET_PART
+$esp_line
+  Hostname:  $HOSTNAME
+  User:      $NEW_USER
+
+Proceed? This will now download and install LimeOS." 17 56 || die "Aborted."
 
 # ── PACSTRAP ──────────────────────────────────────────────────────────────────
 do_pacstrap() {
@@ -314,19 +339,15 @@ do_pacstrap() {
 do_chroot() {
     log "Configuring system"
 
-    # fstab
     genfstab -U "$TARGET" >> "$TARGET/etc/fstab"
 
-    # Timezone
     arch-chroot "$TARGET" ln -sf /usr/share/zoneinfo/UTC /etc/localtime
     arch-chroot "$TARGET" hwclock --systohc
 
-    # Locale
     echo "en_US.UTF-8 UTF-8" >> "$TARGET/etc/locale.gen"
     arch-chroot "$TARGET" locale-gen >> "$LOG" 2>&1
     echo "LANG=en_US.UTF-8" > "$TARGET/etc/locale.conf"
 
-    # Hostname
     echo "$HOSTNAME" > "$TARGET/etc/hostname"
     cat > "$TARGET/etc/hosts" <<HOSTS
 127.0.0.1   localhost
@@ -334,19 +355,16 @@ do_chroot() {
 127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
 HOSTS
 
-    # Services
     for svc in "${SERVICES[@]}"; do
         arch-chroot "$TARGET" systemctl enable "$svc" >> "$LOG" 2>&1 \
             && log "  Enabled $svc" \
-            || warn "  Could not enable $svc (package may not be installed)"
+            || warn "  Could not enable $svc"
     done
 
-    # Root password
     echo ""
     echo -e "${BLD}Set password for root:${RST}"
     arch-chroot "$TARGET" passwd
 
-    # User lime
     log "Creating user: $NEW_USER"
     arch-chroot "$TARGET" useradd -m \
         -G wheel,audio,video,storage,optical,input \
@@ -355,11 +373,9 @@ HOSTS
     echo -e "${BLD}Set password for $NEW_USER:${RST}"
     arch-chroot "$TARGET" passwd "$NEW_USER"
 
-    # sudo for wheel
     sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' \
         "$TARGET/etc/sudoers"
 
-    # GRUB
     log "Installing GRUB"
     if [ "$FIRMWARE" = "uefi" ]; then
         arch-chroot "$TARGET" grub-install \
@@ -374,7 +390,6 @@ HOSTS
             >> "$LOG" 2>&1 || die "grub-install (BIOS) failed"
     fi
 
-    # os-prober so Windows shows up in GRUB
     echo "GRUB_DISABLE_OS_PROBER=false" >> "$TARGET/etc/default/grub"
     arch-chroot "$TARGET" grub-mkconfig -o /boot/grub/grub.cfg \
         >> "$LOG" 2>&1 || die "grub-mkconfig failed"
@@ -391,36 +406,26 @@ do_config() {
 
     log "Extracting config bundle"
     local extract; extract=$(mktemp -d /tmp/config.XXXXXX)
-    tar -xzf "$tarball" -C "$extract" \
-        || die "Failed to extract config.tar.gz"
+    tar -xzf "$tarball" -C "$extract" || die "Failed to extract config.tar.gz"
     rm -f "$tarball"
 
-    # The tar contains: config/ local-share/ system-themes/ sddm/ wallpaper/
-    local bundle
-    # Handle whether tar extracted with or without a top-level folder
-    if [ -d "$extract/limeos-config" ]; then
-        bundle="$extract/limeos-config"
-    else
-        bundle="$extract"
-    fi
+    local bundle="$extract"
+    [ -d "$extract/limeos-config" ] && bundle="$extract/limeos-config"
 
     local user_home="$TARGET/home/$NEW_USER"
 
-    # ~/.config — KDE/Plasma config files
     if [ -d "$bundle/config" ]; then
         log "  Applying ~/.config"
         mkdir -p "$user_home/.config"
         cp -r "$bundle/config/." "$user_home/.config/"
     fi
 
-    # ~/.local/share — Plasma addons, konsole profiles, color schemes etc
     if [ -d "$bundle/local-share" ]; then
         log "  Applying ~/.local/share"
         mkdir -p "$user_home/.local/share"
         cp -r "$bundle/local-share/." "$user_home/.local/share/"
     fi
 
-    # System-wide themes — icons, fonts, cursor, GTK, Plasma, Kvantum, SDDM
     if [ -d "$bundle/system-themes" ]; then
         log "  Applying system themes"
         [ -d "$bundle/system-themes/desktoptheme" ] && \
@@ -437,17 +442,14 @@ do_config() {
             cp -r "$bundle/system-themes/Kvantum" "$TARGET/usr/share/"
         [ -d "$bundle/system-themes/sddm-themes" ] && \
             cp -r "$bundle/system-themes/sddm-themes/." "$TARGET/usr/share/sddm/themes/"
-        # Fonts
-        if [ -d "$bundle/system-themes/fonts-system" ]; then
+        [ -d "$bundle/system-themes/fonts-system" ] && \
             cp -r "$bundle/system-themes/fonts-system/." "$TARGET/usr/share/fonts/"
-        fi
         if [ -d "$bundle/system-themes/fonts-user" ]; then
             mkdir -p "$user_home/.local/share/fonts"
             cp -r "$bundle/system-themes/fonts-user/." "$user_home/.local/share/fonts/"
         fi
     fi
 
-    # SDDM config
     if [ -d "$bundle/sddm" ]; then
         log "  Applying SDDM config"
         [ -f "$bundle/sddm/sddm.conf" ] && \
@@ -456,17 +458,14 @@ do_config() {
             cp -r "$bundle/sddm/sddm.conf.d" "$TARGET/etc/"
     fi
 
-    # Wallpaper — copy into user home
     if [ -d "$bundle/wallpaper" ]; then
         log "  Applying wallpaper"
         mkdir -p "$user_home/.local/share/wallpapers"
         cp -r "$bundle/wallpaper/." "$user_home/.local/share/wallpapers/"
     fi
 
-    # Fix ownership of everything in user home
     arch-chroot "$TARGET" chown -R "$NEW_USER:$NEW_USER" "/home/$NEW_USER"
 
-    # Start menu icon
     log "  Applying start icon"
     curl -fsSL "$START_ICON_URL" -o "$TARGET/etc/start.png" \
         || warn "start.png not found in repo (skipping)"
@@ -484,48 +483,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-main() {
-    log "=== LimeOS installer start ==="
+# ── RUN ───────────────────────────────────────────────────────────────────────
+do_pacstrap
+do_chroot
+do_config
 
-    screen_firmware
-    screen_mode
-    screen_pick_target
-    screen_esp
-    check_bios_gpt
+umount -R "$TARGET" 2>/dev/null || true
+INSTALL_OK=1
 
-    HOSTNAME=$(dialog --stdout --title "LimeOS Installer" \
-        --inputbox "Enter a hostname for this machine:" 8 50) \
-        || die "Cancelled."
-    [ -z "$HOSTNAME" ] && HOSTNAME="limeos"
-
-    local esp_display="${TARGET_ESP:-none}"
-    [ "$FIRMWARE" = "bios" ] && esp_display="N/A"
-
-    dialog --title "LimeOS Installer" --yesno \
-"Ready to install. Summary:
-
-  Firmware:  $FIRMWARE
-  Mode:      $INSTALL_MODE
-  Disk:      $TARGET_DISK
-  Root:      ${TARGET_PART:-will create}
-  ESP:       $esp_display
-  Hostname:  $HOSTNAME
-  User:      $NEW_USER
-
-Proceed?" 18 52 || die "Aborted."
-
-    do_partition
-    do_mount
-    do_pacstrap
-    do_chroot
-    do_config
-
-    umount -R "$TARGET" 2>/dev/null || true
-    INSTALL_OK=1
-
-    log "=== LimeOS installation complete ==="
-    dialog --title "LimeOS Installer" --msgbox \
+log "=== LimeOS installation complete ==="
+dialog --title "LimeOS Installer" --msgbox \
 "Installation complete!
 
 GRUB installed to $TARGET_DISK.
@@ -533,8 +500,5 @@ Windows and other OSes will appear in the boot menu.
 
 Remove the installation media and reboot." 12 54
 
-    clear
-    echo -e "${GRN}${BLD}LimeOS installed. Reboot when ready.${RST}"
-}
-
-main "$@"
+clear
+echo -e "${GRN}${BLD}LimeOS installed. Reboot when ready.${RST}"
